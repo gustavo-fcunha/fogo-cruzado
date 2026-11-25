@@ -141,6 +141,7 @@ def main():
         sys.exit("Defina DATABASE_URL com a conexão do Postgres.")
 
     inicio = datetime.now(timezone.utc)
+    print(f"Atualização iniciada em {inicio:%Y-%m-%d %H:%M} UTC", flush=True)
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(DDL)
         relatorio = None
