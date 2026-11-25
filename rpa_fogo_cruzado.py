@@ -320,32 +320,6 @@ def _em_contexto_novo(browser, *args, **kwargs):
         context.close()
 
 
-def contar_no_site(estados: list[str], headless=True) -> dict[str, int]:
-    """Total de ocorrências de cada estado no site (BUSCAR sem cidade e sem datas),
-    sem baixar nada. Serve para conferir se a base inteira está alinhada."""
-    totais = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        for estado in estados:
-            def buscar():
-                context, page = nova_pagina(browser)
-                try:
-                    carregar_pagina(page)
-                    escolher_opcao(page, "state", estado)
-                    escolher_opcao(page, "type-occurrences", TIPO_OCORRENCIA)
-                    with page.expect_response(lambda r: "/occurrences" in r.url and r.request.method == "GET",
-                                              timeout=120_000) as resp:
-                        page.locator('button[data-cy="filter-button"]').click()
-                    if resp.value.status == 429:
-                        raise RuntimeError("API: limite de requisições (429)")
-                    return resp.value.json()["pageMeta"]["itemCount"]
-                finally:
-                    context.close()
-            totais[estado] = com_tentativas(f"Contar {estado}", buscar)
-        browser.close()
-    return totais
-
-
 def _baixar(page, estado: str, cidade: str | None, destino: Path, periodo=None,
             dividir_se_grande=True) -> tuple[str, int]:
     """Um download pelo site. cidade=None deixa o campo de cidades vazio (o estado
