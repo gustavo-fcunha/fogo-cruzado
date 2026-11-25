@@ -95,7 +95,44 @@ def nova_pagina(browser):
     context = browser.new_context(accept_downloads=True, locale="pt-BR")
     page = context.new_page()
     page.set_default_timeout(60_000)
+    page.on("response", _registrar_erro_api)
     return context, page
+
+
+_ultimo_429 = 0.0  # quando a API do site recusou por limite de requisições
+
+
+def _registrar_erro_api(resposta):
+    """Loga erros da API do site (o 401 de login é normal) e anota os 429."""
+    global _ultimo_429
+    if "api-service" in resposta.url and resposta.status >= 400 and resposta.status != 401:
+        if resposta.status == 429:
+            _ultimo_429 = time.time()
+        print(f"    API {resposta.status}: {resposta.url.split('?')[0]}", flush=True)
+
+
+def pausa_apos_falha(erro: str, tentativa: int, base_s: int):
+    """Se a API limitou as requisições (429) no último minuto, espera a janela
+    zerar; senão, uma pausa curta crescente."""
+    if "429" in erro or time.time() - _ultimo_429 < PAUSA_RATE_LIMIT_S:
+        print(f"    limite da API atingido — aguardando {PAUSA_RATE_LIMIT_S}s", flush=True)
+        time.sleep(PAUSA_RATE_LIMIT_S)
+    else:
+        time.sleep(base_s * tentativa)
+
+
+def com_tentativas(descricao: str, funcao, *args):
+    """Repete uma etapa de navegação que falha de forma passageira (campo do site
+    desabilitado, lentidão, limite de requisições da API)."""
+    for tentativa in range(1, TENTATIVAS + 1):
+        try:
+            return funcao(*args)
+        except Exception as e:  # noqa: BLE001
+            erro = f"{type(e).__name__}: {e}".splitlines()[0]
+            print(f"{descricao}: tentativa {tentativa} falhou — {erro}", flush=True)
+            if tentativa == TENTATIVAS:
+                raise
+            pausa_apos_falha(erro, tentativa, 15)
 
 
 def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> str:
@@ -221,13 +258,13 @@ def executar(out_dir: Path = OUT_DIR, estados_filtro=None, force=False, headless
         browser = p.chromium.launch(headless=headless)
         _, page = nova_pagina(browser)  # só para listar estados/cidades
 
-        estados = listar_estados(page)
+        estados = com_tentativas("Listar estados", listar_estados, page)
         if estados_filtro:
             estados = [e for e in estados if e in estados_filtro]
         print(f"Estados: {estados}", flush=True)
 
         for estado in estados:
-            cidades = listar_cidades(page, estado)
+            cidades = com_tentativas(f"Listar cidades de {estado}", listar_cidades, page, estado)
             print(f"\n=== {estado}: {len(cidades)} cidades ===", flush=True)
             pasta = out_dir / slug(estado)
             pasta.mkdir(exist_ok=True)
@@ -251,8 +288,7 @@ def executar(out_dir: Path = OUT_DIR, estados_filtro=None, force=False, headless
                     except Exception as e:  # noqa: BLE001
                         erro = f"{type(e).__name__}: {e}".splitlines()[0]
                         print(f"{prefixo}: tentativa {tentativa} falhou — {erro}", flush=True)
-                        # 429 = limite de 60 req/min da API: esperar a janela zerar
-                        time.sleep(PAUSA_RATE_LIMIT_S if "429" in erro else 5 * tentativa)
+                        pausa_apos_falha(erro, tentativa, 5)
                 relatorio.append([estado, cidade, status if not erro else "erro",
                                   str(destino) if status.startswith("ok") else erro])
 
