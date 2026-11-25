@@ -45,10 +45,21 @@ def abrir_combo(page, data_cy: str):
     """Os campos ficam desabilitados enquanto o site carrega estados/cidades,
     e um clique nesse momento não abre a lista — então espera e insiste."""
     campo = page.locator(f'input[data-cy="{data_cy}"]')
+    setinha = page.locator(f'.MuiAutocomplete-root:has(input[data-cy="{data_cy}"]) '
+                           '.MuiAutocomplete-popupIndicator')
     opcao = page.locator('[role="listbox"] [role="option"]').first
-    for _ in range(12):
+    for tentativa in range(12):
         page.wait_for_function("el => !el.disabled", arg=campo.element_handle(), timeout=60_000)
-        campo.click()
+        # Em máquinas lentas (Railway) o clique no texto do campo às vezes se perde:
+        # alterna entre a setinha ▼, o teclado e o clique no campo.
+        forma = tentativa % 3
+        if forma == 0 and setinha.count():
+            setinha.first.click()
+        elif forma == 1:
+            campo.focus()
+            page.keyboard.press("ArrowDown")
+        else:
+            campo.click()
         try:
             opcao.wait_for(timeout=5_000)
             return campo
