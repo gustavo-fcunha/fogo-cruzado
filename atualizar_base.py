@@ -1,35 +1,40 @@
 """
 Atualização semanal da base Fogo Cruzado no Postgres (job agendado no Railway).
 
-Passos:
-  1. Baixa o CSV de todas as cidades pelo site (rpa_fogo_cruzado), numa pasta nova.
-  2. Confere cada cidade com o total da API (gerar_relatorio).
-  3. Se tudo bater, junta os CSVs e substitui a tabela `ocorrencias` numa única
-     transação. Se algo falhar, a base anterior fica intacta e o job termina com
-     erro (o Railway marca a execução como falha).
-  4. Registra a execução na tabela `execucoes`.
+Modo incremental (padrão, o que o Railway roda):
+  1. Se a tabela `ocorrencias` estiver vazia, carrega a base inicial
+     (base_inicial/*.csv.gz, a carga completa feita pelo RPA).
+  2. Para cada estado, pega a maior data registrada e baixa pelo site, num único
+     download por estado (todas as cidades), o período de (maior data - 60 dias) até hoje.
+  3. Confere cada arquivo com o total que o próprio site informou ao clicar em BUSCAR.
+  4. Numa única transação: insere as ocorrências novas, atualiza as existentes (pelo id)
+     e remove as que sumiram do site dentro do período baixado.
+  5. Registra a execução na tabela `execucoes`.
+  Se qualquer estado falhar ou não conferir, nada é alterado e o job termina com erro.
 
-Uso:
-  python atualizar_base.py                       # fluxo completo (o que o Railway roda)
-  python atualizar_base.py --carregar downloads_csv
-                                                 # só valida e carrega uma pasta já baixada
+Modo completo (--completo): baixa cidade por cidade, todo o histórico, e substitui a
+tabela inteira. Útil para realinhar a base de tempos em tempos.
+
 Variável obrigatória: DATABASE_URL (string de conexão do Postgres).
 """
 
 import argparse
 import csv
+import gzip
 import json
 import os
 import sys
 import tempfile
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
 
-import gerar_relatorio
 import rpa_fogo_cruzado
+
+JANELA_DIAS = 60  # sobreposição: pega registros atrasados e correções recentes
+BASE_INICIAL = sorted((Path(__file__).parent / "base_inicial").glob("*.csv.gz"))
 
 COLUNAS = [
     ("id", "text PRIMARY KEY"),
@@ -58,10 +63,10 @@ CREATE TABLE IF NOT EXISTS execucoes (
     inicio timestamptz NOT NULL,
     fim timestamptz NOT NULL,
     status text NOT NULL,              -- sucesso | falha
-    total_ocorrencias integer,
+    total_ocorrencias integer,         -- tamanho da base ao final
     cidades integer,
     detalhe text,
-    relatorio jsonb                    -- conferência por cidade
+    relatorio jsonb                    -- conferência por estado (incremental) ou cidade (completo)
 );
 """
 
@@ -81,44 +86,58 @@ def converter(campo: str, valor: str):
     return valor
 
 
-def compilar(pasta: Path, relatorio: list[list]) -> Path:
-    """Junta os CSVs das cidades (na ordem do relatório) em pasta/fogo_cruzado_compilado.csv."""
-    destino = pasta / "fogo_cruzado_compilado.csv"
-    cabecalho = None
-    with destino.open("w", newline="", encoding="utf-8") as saida:
-        w = csv.writer(saida, lineterminator="\r\n")
-        for linha in relatorio:
-            arquivo = pasta / linha[2]
-            if not linha[2] or not arquivo.exists():
-                continue  # cidade sem ocorrências
-            with arquivo.open(newline="", encoding="utf-8") as f:
-                leitor = csv.reader(f)
-                cab = next(leitor)
-                if cabecalho is None:
-                    cabecalho = cab
-                    w.writerow(cab)
-                elif cab != cabecalho:
-                    raise RuntimeError(f"cabeçalho diferente em {linha[2]}")
-                w.writerows(leitor)
-    if cabecalho != NOMES:
-        raise RuntimeError(f"colunas do CSV mudaram no site: {cabecalho}")
-    return destino
+def ler_csv(arquivo: Path) -> list[dict]:
+    abrir = gzip.open if arquivo.suffix == ".gz" else open
+    with abrir(arquivo, "rt", newline="", encoding="utf-8") as f:
+        leitor = csv.DictReader(f)
+        if leitor.fieldnames != NOMES:
+            raise RuntimeError(f"colunas do CSV mudaram no site ({arquivo.name}): {leitor.fieldnames}")
+        return list(leitor)
 
 
-def carregar(conn, compilado: Path, agora: datetime) -> int:
-    """Substitui o conteúdo de `ocorrencias` pelo CSV compilado, numa transação:
-    quem consulta a tabela vê a base antiga até o commit."""
+def conferir(registros: list[dict], total_site: int, nome: str):
+    """O arquivo precisa ter exatamente as ocorrências que o site disse ter."""
+    ids = {r["id"] for r in registros}
+    if len(ids) != total_site or len(registros) != total_site:
+        raise RuntimeError(f"{nome}: arquivo com {len(registros)} linhas / {len(ids)} ids, "
+                           f"site informou {total_site}")
+
+
+def copiar_para_carga(cur, registros: list[dict], agora: datetime):
+    """Cria a tabela temporária `carga` com os registros (vale até o fim da transação)."""
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS carga (LIKE ocorrencias) ON COMMIT DROP")
+    with cur.copy(f"COPY carga ({', '.join(NOMES)}, atualizado_em) FROM STDIN") as copy:
+        for registro in registros:
+            copy.write_row([converter(c, registro[c]) for c in NOMES] + [agora])
+
+
+def substituir_tudo(conn, registros: list[dict], agora: datetime) -> int:
     with conn.cursor() as cur:
-        cur.execute("CREATE TEMP TABLE carga (LIKE ocorrencias) ON COMMIT DROP")
-        with compilado.open(newline="", encoding="utf-8") as f, \
-                cur.copy(f"COPY carga ({', '.join(NOMES)}, atualizado_em) FROM STDIN") as copy:
-            for registro in csv.DictReader(f):
-                copy.write_row([converter(c, registro[c]) for c in NOMES] + [agora])
-        cur.execute("SELECT count(*) FROM carga")
-        total = cur.fetchone()[0]
+        copiar_para_carga(cur, registros, agora)
         cur.execute("DELETE FROM ocorrencias")
         cur.execute("INSERT INTO ocorrencias SELECT * FROM carga")
-    return total
+        return cur.rowcount
+
+
+def mesclar_periodo(conn, estado: str, inicio: date, fim: date, registros: list[dict],
+                    agora: datetime) -> dict:
+    """Insere/atualiza os registros baixados de um estado e remove os que sumiram
+    do site dentro do período. Na remoção a janela encolhe 2 dias de cada lado,
+    porque o filtro de data do site tem efeito de fuso nas pontas."""
+    sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in NOMES[1:] + ["atualizado_em"])
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS carga")
+        copiar_para_carga(cur, registros, agora)
+        cur.execute("SELECT count(*) FROM carga c JOIN ocorrencias o USING (id)")
+        existentes = cur.fetchone()[0]
+        cur.execute(f"INSERT INTO ocorrencias SELECT * FROM carga ON CONFLICT (id) DO UPDATE SET {sets}")
+        cur.execute(
+            "DELETE FROM ocorrencias o WHERE o.state = %s AND o.data >= %s AND o.data < %s"
+            " AND NOT EXISTS (SELECT 1 FROM carga c WHERE c.id = o.id)",
+            (estado, inicio + timedelta(days=2), fim - timedelta(days=2)),
+        )
+        removidas = cur.rowcount
+    return {"novas": len(registros) - existentes, "atualizadas": existentes, "removidas": removidas}
 
 
 def registrar(conn, inicio, status, total=None, cidades=None, detalhe=None, relatorio=None):
@@ -127,13 +146,101 @@ def registrar(conn, inicio, status, total=None, cidades=None, detalhe=None, rela
             "INSERT INTO execucoes (inicio, fim, status, total_ocorrencias, cidades, detalhe, relatorio)"
             " VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (inicio, datetime.now(timezone.utc), status, total, cidades, detalhe,
-             json.dumps(relatorio, ensure_ascii=False) if relatorio is not None else None),
+             json.dumps(relatorio, ensure_ascii=False, default=str) if relatorio is not None else None),
         )
+
+
+def total_base(conn) -> tuple[int, int]:
+    return conn.execute("SELECT count(*), count(DISTINCT (state, city)) FROM ocorrencias").fetchone()
+
+
+def carregar_base_inicial(conn, agora: datetime):
+    if not BASE_INICIAL:
+        raise RuntimeError("tabela vazia e nenhuma base inicial em base_inicial/")
+    arquivo = BASE_INICIAL[-1]
+    registros = ler_csv(arquivo)
+    with conn.transaction():
+        total = substituir_tudo(conn, registros, agora)
+    print(f"Base inicial carregada: {total} ocorrências de {arquivo.name}", flush=True)
+
+
+def atualizar_incremental(conn, pasta: Path, agora: datetime) -> list[dict]:
+    if conn.execute("SELECT NOT EXISTS (SELECT 1 FROM ocorrencias)").fetchone()[0]:
+        carregar_base_inicial(conn, agora)
+
+    maiores = dict(conn.execute("SELECT state, max(data)::date FROM ocorrencias GROUP BY state").fetchall())
+    inicio_por_estado = {estado: d - timedelta(days=JANELA_DIAS) for estado, d in maiores.items()}
+    fim = date.today() + timedelta(days=1)  # o filtro do site não inclui o último dia
+    for estado, d in maiores.items():
+        print(f"{estado}: maior data na base {d:%d/%m/%Y} → baixa de "
+              f"{inicio_por_estado[estado]:%d/%m/%Y} até hoje", flush=True)
+
+    relatorio_rpa = rpa_fogo_cruzado.executar_incremental(pasta, inicio_por_estado, fim)
+
+    baixados, relatorio = [], []
+    for estado, inicio, fim_estado, status, arquivo, total_site in relatorio_rpa:
+        if status == "erro":
+            raise RuntimeError(f"{estado}: download falhou — {arquivo}")
+        registros = [] if status == "sem_resultados" else ler_csv(Path(arquivo))
+        conferir(registros, total_site or 0, estado)
+        baixados.append((estado, inicio, fim_estado, registros))
+
+    with conn.transaction():
+        for estado, inicio, fim_estado, registros in baixados:
+            resultado = mesclar_periodo(conn, estado, inicio, fim_estado, registros, agora)
+            relatorio.append({"estado": estado, "inicio": inicio, "fim": fim_estado,
+                              "baixadas": len(registros), **resultado})
+            print(f"{estado}: {len(registros)} baixadas — {resultado}", flush=True)
+        total, cidades = total_base(conn)
+
+    # Conferência geral: total de cada estado no site x na base. Diferença indica
+    # correções/remoções antigas, fora da janela — sinal para rodar --completo.
+    # Se a conferência falhar, a atualização (já gravada) continua valendo.
+    na_base = dict(conn.execute("SELECT state, count(*) FROM ocorrencias GROUP BY state").fetchall())
+    try:
+        no_site = rpa_fogo_cruzado.contar_no_site([estado for estado, *_ in baixados])
+    except Exception as e:  # noqa: BLE001
+        no_site = None
+        print(f"Conferência geral não executada: {type(e).__name__}: {e}", flush=True)
+    divergencias = {e: {"site": n, "base": na_base.get(e, 0)}
+                    for e, n in (no_site or {}).items() if n != na_base.get(e, 0)}
+    for item in relatorio:
+        item["total_base"] = na_base.get(item["estado"], 0)
+        item["total_site"] = no_site.get(item["estado"]) if no_site else None
+    detalhe = "incremental"
+    if no_site is None:
+        detalhe += " — conferência geral não executada"
+    elif divergencias:
+        detalhe += f" — AVISO: base diferente do site em {divergencias}; considere rodar --completo"
+        print(f"AVISO: totais diferentes do site: {divergencias}", flush=True)
+    else:
+        print("Conferência geral: os totais de todos os estados batem com o site.", flush=True)
+    registrar(conn, agora, "sucesso", total, cidades, detalhe=detalhe, relatorio=relatorio)
+    return relatorio
+
+
+def atualizar_completo(conn, pasta: Path, agora: datetime) -> list[dict]:
+    relatorio_rpa = rpa_fogo_cruzado.executar(pasta, force=True)
+    registros, relatorio = [], []
+    for estado, cidade, status, arquivo, total_site in relatorio_rpa:
+        if status == "erro":
+            raise RuntimeError(f"{estado}/{cidade}: download falhou — {arquivo}")
+        da_cidade = [] if status == "sem_resultados" else ler_csv(Path(arquivo))
+        conferir(da_cidade, total_site or 0, f"{estado}/{cidade}")
+        registros += da_cidade
+        relatorio.append({"estado": estado, "cidade": cidade, "registros": len(da_cidade)})
+
+    with conn.transaction():
+        substituir_tudo(conn, registros, agora)
+        total, cidades = total_base(conn)
+        registrar(conn, agora, "sucesso", total, cidades, detalhe="completo", relatorio=relatorio)
+    return relatorio
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--carregar", type=Path, help="pula o download e carrega esta pasta")
+    ap.add_argument("--completo", action="store_true",
+                    help="baixa todo o histórico cidade por cidade e substitui a tabela")
     args = ap.parse_args()
 
     url = os.environ.get("DATABASE_URL")
@@ -141,33 +248,21 @@ def main():
         sys.exit("Defina DATABASE_URL com a conexão do Postgres.")
 
     inicio = datetime.now(timezone.utc)
-    print(f"Atualização iniciada em {inicio:%Y-%m-%d %H:%M} UTC", flush=True)
+    modo = "completo" if args.completo else "incremental"
+    print(f"Atualização ({modo}) iniciada em {inicio:%Y-%m-%d %H:%M} UTC", flush=True)
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(DDL)
-        relatorio = None
+        pasta = Path(tempfile.mkdtemp(prefix="fogo_cruzado_"))
         try:
-            if args.carregar:
-                pasta = args.carregar
+            if args.completo:
+                atualizar_completo(conn, pasta, inicio)
             else:
-                pasta = Path(tempfile.mkdtemp(prefix="fogo_cruzado_"))
-                print(f"Baixando para {pasta}", flush=True)
-                rpa_fogo_cruzado.executar(pasta, force=True)
-
-            print("\nConferindo com a API...", flush=True)
-            relatorio = gerar_relatorio.gerar(pasta)
-            divergentes = [f"{l[0]}/{l[1]}" for l in relatorio if l[5] != "SIM"]
-            if divergentes:
-                raise RuntimeError(f"{len(divergentes)} cidade(s) não conferem: {', '.join(divergentes)}")
-
-            compilado = compilar(pasta, relatorio)
-            with conn.transaction():
-                total = carregar(conn, compilado, inicio)
-                registrar(conn, inicio, "sucesso", total, len(relatorio), relatorio=relatorio)
-            print(f"\nBase atualizada: {total} ocorrências de {len(relatorio)} cidades.", flush=True)
+                atualizar_incremental(conn, pasta, inicio)
+            total, cidades = total_base(conn)
+            print(f"\nBase atualizada: {total} ocorrências de {cidades} cidades.", flush=True)
         except Exception as e:
             detalhe = f"{type(e).__name__}: {e}"
-            registrar(conn, inicio, "falha", detalhe=detalhe + "\n" + traceback.format_exc(),
-                      relatorio=relatorio)
+            registrar(conn, inicio, "falha", detalhe=f"{modo}: {detalhe}\n{traceback.format_exc()}")
             print(f"\nFALHA — base anterior mantida. {detalhe}", flush=True)
             sys.exit(1)
 

@@ -19,7 +19,7 @@ import os
 import re
 import time
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -135,8 +135,9 @@ def com_tentativas(descricao: str, funcao, *args):
             pausa_apos_falha(erro, tentativa, 15)
 
 
-def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> str:
-    """Retorna 'ok', 'ok (N partes por ano)' ou 'sem_resultados'.
+def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> tuple[str, int]:
+    """Retorna (status, total de ocorrências que o site informou), com status
+    'ok', 'ok (N partes por ano)' ou 'sem_resultados'.
 
     Usa um contexto novo por download: o site só salva o CSV depois de paginar a
     API inteira, e o Chrome bloqueia em silêncio esse download "automático" se o
@@ -144,7 +145,7 @@ def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> str:
     """
     status, total = _em_contexto_novo(browser, estado, cidade, destino)
     if status != "grande":
-        return status
+        return status, total
 
     # A API limita a 60 requisições/min e o site pagina de 200 em 200: acima de
     # ~10 mil ocorrências ele toma HTTP 429 e quebra. Nesses casos usamos os
@@ -155,7 +156,8 @@ def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> str:
         parte = destino.with_name(f"{destino.stem}__{ano}.csv")
         time.sleep(PAUSA_RATE_LIMIT_S)
         status, _ = _em_contexto_novo(
-            browser, estado, cidade, parte, periodo=(f"{ano}-01-01", f"{ano + 1}-01-01")
+            browser, estado, cidade, parte, periodo=(f"{ano}-01-01", f"{ano + 1}-01-01"),
+            dividir_se_grande=False,
         )
         print(f"    {ano}: {status}")
         if status == "ok":
@@ -163,7 +165,37 @@ def baixar_cidade(browser, estado: str, cidade: str, destino: Path) -> str:
     juntar_csvs(partes, destino, total)
     for parte in partes:
         parte.unlink()
-    return f"ok ({len(partes)} partes por ano)"
+    return f"ok ({len(partes)} partes por ano)", total
+
+
+def baixar_estado(browser, estado: str, inicio: date, fim: date, destino: Path) -> tuple[str, int]:
+    """Baixa o CSV de todas as cidades de um estado num período (campo de cidades
+    vazio + datas). Retorna (status, total informado pelo site). Períodos com
+    ocorrências demais para um download são divididos mês a mês."""
+    periodo = (inicio.isoformat(), fim.isoformat())
+    status, total = _em_contexto_novo(browser, estado, None, destino, periodo=periodo)
+    if status != "grande":
+        return status, total
+
+    print(f"    {total} ocorrências — baixando mês a mês", flush=True)
+    partes, atual = [], inicio
+    while atual < fim:
+        proximo = min(date(atual.year + atual.month // 12, atual.month % 12 + 1, 1), fim)
+        parte = destino.with_name(f"{destino.stem}__{atual:%Y_%m}.csv")
+        time.sleep(PAUSA_RATE_LIMIT_S)
+        # o fim de cada parte avança 1 dia (sobreposição); juntar_csvs remove duplicatas
+        status, _ = _em_contexto_novo(
+            browser, estado, None, parte,
+            periodo=(atual.isoformat(), min(proximo + timedelta(days=1), fim).isoformat()),
+            dividir_se_grande=False,
+        )
+        if status == "ok":
+            partes.append(parte)
+        atual = proximo
+    juntar_csvs(partes, destino, total)
+    for parte in partes:
+        parte.unlink()
+    return f"ok ({len(partes)} partes por mês)", total
 
 
 def juntar_csvs(partes: list[Path], destino: Path, total_ocorrencias: int):
@@ -199,10 +231,40 @@ def _em_contexto_novo(browser, *args, **kwargs):
         context.close()
 
 
-def _baixar(page, estado: str, cidade: str, destino: Path, periodo=None) -> tuple[str, int]:
+def contar_no_site(estados: list[str], headless=True) -> dict[str, int]:
+    """Total de ocorrências de cada estado no site (BUSCAR sem cidade e sem datas),
+    sem baixar nada. Serve para conferir se a base inteira está alinhada."""
+    totais = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        for estado in estados:
+            def buscar():
+                context, page = nova_pagina(browser)
+                try:
+                    carregar_pagina(page)
+                    escolher_opcao(page, "state", estado)
+                    escolher_opcao(page, "type-occurrences", TIPO_OCORRENCIA)
+                    with page.expect_response(lambda r: "/occurrences" in r.url and r.request.method == "GET",
+                                              timeout=120_000) as resp:
+                        page.locator('button[data-cy="filter-button"]').click()
+                    if resp.value.status == 429:
+                        raise RuntimeError("API: limite de requisições (429)")
+                    return resp.value.json()["pageMeta"]["itemCount"]
+                finally:
+                    context.close()
+            totais[estado] = com_tentativas(f"Contar {estado}", buscar)
+        browser.close()
+    return totais
+
+
+def _baixar(page, estado: str, cidade: str | None, destino: Path, periodo=None,
+            dividir_se_grande=True) -> tuple[str, int]:
+    """Um download pelo site. cidade=None deixa o campo de cidades vazio (o estado
+    inteiro). O total vem da resposta que o próprio site recebe ao clicar em BUSCAR."""
     carregar_pagina(page)
     escolher_opcao(page, "state", estado)
-    escolher_opcao(page, "cities", cidade)
+    if cidade:
+        escolher_opcao(page, "cities", cidade)
     if periodo:
         page.locator('input[data-cy="initial-date"]').fill(periodo[0])
         page.locator('input[data-cy="final-date"]').fill(periodo[1])
@@ -215,7 +277,7 @@ def _baixar(page, estado: str, cidade: str, destino: Path, periodo=None) -> tupl
     total = resp.value.json().get("pageMeta", {}).get("itemCount", 1)
     if total == 0:
         return "sem_resultados", 0
-    if periodo is None and total > MAX_OCORRENCIAS_POR_DOWNLOAD:
+    if dividir_se_grande and total > MAX_OCORRENCIAS_POR_DOWNLOAD:
         return "grande", total
 
     botao = page.locator('button[data-cy="download-csv-button"]')
@@ -249,8 +311,8 @@ def _baixar(page, estado: str, cidade: str, destino: Path, periodo=None) -> tupl
 
 
 def executar(out_dir: Path = OUT_DIR, estados_filtro=None, force=False, headless=True) -> list[list[str]]:
-    """Baixa o CSV de cada cidade em out_dir/<Estado>/<Cidade>.csv e devolve as
-    linhas do relatório [estado, cidade, status, arquivo_ou_erro]."""
+    """Carga completa: baixa o CSV de cada cidade em out_dir/<Estado>/<Cidade>.csv e
+    devolve as linhas [estado, cidade, status, arquivo_ou_erro, total_no_site]."""
     out_dir.mkdir(parents=True, exist_ok=True)
     relatorio = []
 
@@ -274,14 +336,14 @@ def executar(out_dir: Path = OUT_DIR, estados_filtro=None, force=False, headless
                 prefixo = f"[{estado} {i}/{len(cidades)}] {cidade}"
                 if destino.exists() and not force:
                     print(f"{prefixo}: já existe, pulando", flush=True)
-                    relatorio.append([estado, cidade, "ja_existia", str(destino)])
+                    relatorio.append([estado, cidade, "ja_existia", str(destino), None])
                     continue
 
-                status, erro = "erro", ""
+                status, erro, total = "erro", "", None
                 for tentativa in range(1, TENTATIVAS + 1):
                     try:
                         t0 = time.time()
-                        status = baixar_cidade(browser, estado, cidade, destino)
+                        status, total = baixar_cidade(browser, estado, cidade, destino)
                         print(f"{prefixo}: {status} ({time.time() - t0:.0f}s)", flush=True)
                         erro = ""
                         break
@@ -290,8 +352,43 @@ def executar(out_dir: Path = OUT_DIR, estados_filtro=None, force=False, headless
                         print(f"{prefixo}: tentativa {tentativa} falhou — {erro}", flush=True)
                         pausa_apos_falha(erro, tentativa, 5)
                 relatorio.append([estado, cidade, status if not erro else "erro",
-                                  str(destino) if status.startswith("ok") else erro])
+                                  str(destino) if status.startswith("ok") else erro, total])
 
+        browser.close()
+    return relatorio
+
+
+def executar_incremental(out_dir: Path, inicio_por_estado: dict, fim: date,
+                         headless=True) -> list[list]:
+    """Atualização incremental: um download por estado (todas as cidades) do período
+    [inicio_por_estado[estado], fim). Estados do site ausentes do dicionário usam
+    ANO_INICIAL. Devolve [estado, inicio, fim, status, arquivo_ou_erro, total_no_site]."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    relatorio = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        _, page = nova_pagina(browser)
+        estados = com_tentativas("Listar estados", listar_estados, page)
+        print(f"Estados: {estados}", flush=True)
+
+        for estado in estados:
+            inicio = inicio_por_estado.get(estado, date(ANO_INICIAL, 1, 1))
+            destino = out_dir / f"{slug(estado)}.csv"
+            prefixo = f"[{estado}] {inicio:%d/%m/%Y} a {fim:%d/%m/%Y}"
+            status, erro, total = "erro", "", None
+            for tentativa in range(1, TENTATIVAS + 1):
+                try:
+                    t0 = time.time()
+                    status, total = baixar_estado(browser, estado, inicio, fim, destino)
+                    print(f"{prefixo}: {status}, {total} ocorrências ({time.time() - t0:.0f}s)", flush=True)
+                    erro = ""
+                    break
+                except Exception as e:  # noqa: BLE001
+                    erro = f"{type(e).__name__}: {e}".splitlines()[0]
+                    print(f"{prefixo}: tentativa {tentativa} falhou — {erro}", flush=True)
+                    pausa_apos_falha(erro, tentativa, 5)
+            relatorio.append([estado, inicio, fim, status if not erro else "erro",
+                              str(destino) if status.startswith("ok") else erro, total])
         browser.close()
     return relatorio
 
@@ -308,7 +405,7 @@ def main():
     rel = OUT_DIR / "relatorio.csv"
     with rel.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["estado", "cidade", "status", "arquivo_ou_erro"])
+        w.writerow(["estado", "cidade", "status", "arquivo_ou_erro", "total_no_site"])
         w.writerows(relatorio)
     resumo = {s: sum(1 for r in relatorio if r[2] == s) for s in {r[2] for r in relatorio}}
     print(f"\nConcluído em {datetime.now():%H:%M:%S} — {resumo}. Relatório: {rel}")
