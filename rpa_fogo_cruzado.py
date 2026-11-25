@@ -69,6 +69,17 @@ def abrir_combo(page, data_cy: str):
     raise PWTimeout(f"lista do campo {data_cy} não abriu")
 
 
+def _anotar_lista(page, resposta):
+    if "api-service" not in resposta.url or resposta.status != 200:
+        return
+    for nome in ("states", "cities"):
+        if f"/{nome}" in resposta.url.split("?")[0]:
+            try:
+                page._listas[nome] = len(resposta.json().get("data") or [])
+            except Exception:  # noqa: BLE001
+                page._listas[nome] = 0
+
+
 def _resumir(resposta) -> str:
     """Uma linha por chamada à API do site, com a quantidade de itens das listas."""
     caminho = resposta.url.split("?")[0].split("/api/v2")[-1]
@@ -111,8 +122,29 @@ def escolher_opcao(page, data_cy: str, texto: str):
 
 
 def carregar_pagina(page):
-    page.goto(URL, wait_until="networkidle")
-    page.locator('input[data-cy="state"]').wait_for()
+    """Abre a busca. A partir do Railway a API às vezes devolve a lista de estados
+    vazia (200 com 0 itens) e o campo fica sem opções: nesse caso recarrega."""
+    for tentativa in range(1, 11):
+        page._listas = {}
+        page.goto(URL, wait_until="networkidle")
+        page.locator('input[data-cy="state"]').wait_for()
+        if page._listas.get("states"):
+            return
+        print(f"    API devolveu {page._listas.get('states', 'nenhuma')} lista de estados "
+              f"— recarregando ({tentativa}/10)", flush=True)
+        page.wait_for_timeout(3_000)
+    raise RuntimeError("a API do site não devolveu a lista de estados")
+
+
+def esperar_cidades(page):
+    """Depois de escolher o estado, confirma que a API devolveu as cidades."""
+    page.locator('input[data-cy="cities"]').wait_for()
+    for _ in range(40):
+        if page._listas.get("cities") is not None:
+            break
+        page.wait_for_timeout(250)
+    if not page._listas.get("cities"):
+        raise RuntimeError(f"a API do site devolveu {page._listas.get('cities')} cidades")
 
 
 def listar_estados(page) -> list[str]:
@@ -126,6 +158,7 @@ def listar_estados(page) -> list[str]:
 def listar_cidades(page, estado: str) -> list[str]:
     carregar_pagina(page)
     escolher_opcao(page, "state", estado)
+    esperar_cidades(page)
     abrir_combo(page, "cities")
     cidades = opcoes_visiveis(page)
     page.keyboard.press("Escape")
@@ -138,6 +171,8 @@ def nova_pagina(browser):
     page.set_default_timeout(60_000)
     page.on("response", _registrar_erro_api)
     page._chamadas_api = []
+    page._listas = {}  # quantos itens a última resposta de /states e /cities trouxe
+    page.on("response", lambda r: _anotar_lista(page, r))
     page.on("response", lambda r: "api-service" in r.url and page._chamadas_api.append(_resumir(r)))
     page.on("requestfinished", _registrar_lentidao)
     page.on("requestfailed", lambda req: "api-service" in req.url and print(
@@ -318,6 +353,7 @@ def _baixar(page, estado: str, cidade: str | None, destino: Path, periodo=None,
     carregar_pagina(page)
     escolher_opcao(page, "state", estado)
     if cidade:
+        esperar_cidades(page)
         escolher_opcao(page, "cities", cidade)
     if periodo:
         page.locator('input[data-cy="initial-date"]').fill(periodo[0])
