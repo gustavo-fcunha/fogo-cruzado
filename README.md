@@ -15,8 +15,9 @@ Job semanal no Railway que mantém a tabela `ocorrencias` do Postgres alinhada c
 3. Confere cada arquivo com o total do site.
 4. Numa transação: insere as novas, atualiza as existentes (pelo `id`) e remove as que
    sumiram do site dentro do período. Se algo falhar, nada é alterado e o job sai com erro.
-5. Só o período acima é consultado no site. Correções ou remoções de ocorrências mais
-   antigas que a janela de 60 dias não são vistas; para realinhar tudo, rode uma carga completa.
+5. **Conferência geral**: total de cada estado no site × na base. Diferença (correções
+   ou remoções antigas, fora da janela de 60 dias) fica registrada como aviso em
+   `execucoes.detalhe` — sinal para rodar uma carga completa.
 
 **Carga completa** (`python atualizar_base.py --completo`): baixa todo o histórico cidade por
 cidade (~40 min) e substitui a tabela inteira.
@@ -26,7 +27,7 @@ cidade (~40 min) e substitui a tabela inteira.
 | Arquivo | O que faz |
 |---|---|
 | `atualizar_base.py` | Fluxo de atualização (incremental ou `--completo`) e gravação no Postgres. |
-| `rpa_fogo_cruzado.py` | RPA: download por cidade e por estado+período. Espera 65s quando a API do site limita requisições (429; limite de 60/min). A partir do Railway a API às vezes devolve a lista de estados/cidades vazia (200 com 0 itens): o RPA recarrega a página. Quando um campo não abre, o log traz um `DIAGNÓSTICO` (estado do campo, chamadas à API e texto da tela). |
+| `rpa_fogo_cruzado.py` | RPA: download por cidade, por estado+período, e contagem por estado. Espera 65s quando a API do site limita requisições (429; limite de 60/min). A partir do Railway a API às vezes devolve a lista de estados/cidades vazia (200 com 0 itens): o RPA recarrega a página. Quando um campo não abre, o log traz um `DIAGNÓSTICO` (estado do campo, chamadas à API e texto da tela). |
 | `base_inicial/` | Base inicial comprimida, usada só quando a tabela está vazia. |
 | `Dockerfile` | Python 3.12 + Playwright/Chromium. |
 

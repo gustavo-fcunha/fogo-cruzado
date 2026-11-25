@@ -9,7 +9,7 @@ Modo incremental (padrão, o que o Railway roda):
   3. Confere cada arquivo com o total que o próprio site informou ao clicar em BUSCAR.
   4. Numa única transação: insere as ocorrências novas, atualiza as existentes (pelo id)
      e remove as que sumiram do site dentro do período baixado.
-  5. Registra a execução na tabela `execucoes`. Só o período acima é consultado no site.
+  5. Registra a execução na tabela `execucoes`.
   Se qualquer estado falhar ou não conferir, nada é alterado e o job termina com erro.
 
 Modo completo (--completo): baixa cidade por cidade, todo o histórico, e substitui a
@@ -195,7 +195,30 @@ def atualizar_incremental(conn, pasta: Path, agora: datetime) -> list[dict]:
                               "baixadas": len(registros), **resultado})
             print(f"{estado}: {len(registros)} baixadas — {resultado}", flush=True)
         total, cidades = total_base(conn)
-        registrar(conn, agora, "sucesso", total, cidades, detalhe="incremental", relatorio=relatorio)
+
+    # Conferência geral: total de cada estado no site x na base. Diferença indica
+    # correções/remoções antigas, fora da janela — sinal para rodar --completo.
+    # Se a conferência falhar, a atualização (já gravada) continua valendo.
+    na_base = dict(conn.execute("SELECT state, count(*) FROM ocorrencias GROUP BY state").fetchall())
+    try:
+        no_site = rpa_fogo_cruzado.contar_no_site([estado for estado, *_ in baixados])
+    except Exception as e:  # noqa: BLE001
+        no_site = None
+        print(f"Conferência geral não executada: {type(e).__name__}: {e}", flush=True)
+    divergencias = {e: {"site": n, "base": na_base.get(e, 0)}
+                    for e, n in (no_site or {}).items() if n != na_base.get(e, 0)}
+    for item in relatorio:
+        item["total_base"] = na_base.get(item["estado"], 0)
+        item["total_site"] = no_site.get(item["estado"]) if no_site else None
+    detalhe = "incremental"
+    if no_site is None:
+        detalhe += " — conferência geral não executada"
+    elif divergencias:
+        detalhe += f" — AVISO: base diferente do site em {divergencias}; considere rodar --completo"
+        print(f"AVISO: totais diferentes do site: {divergencias}", flush=True)
+    else:
+        print("Conferência geral: os totais de todos os estados batem com o site.", flush=True)
+    registrar(conn, agora, "sucesso", total, cidades, detalhe=detalhe, relatorio=relatorio)
     return relatorio
 
 
@@ -249,6 +272,11 @@ def notificar_slack(conn, inicio: datetime, relatorio=None, erro: str | None = N
     if erro:
         blocos.append({"type": "section", "text": {"type": "mrkdwn",
                        "text": f":x: *A atualização falhou* — a base anterior foi mantida.\n`{erro[:500]}`"}})
+    divergentes = [i for i in (relatorio or []) if i.get("total_site") not in (None, i.get("total_base"))]
+    if divergentes:
+        aviso = ", ".join(f"{i['estado']} (site {i['total_site']}, base {i['total_base']})" for i in divergentes)
+        blocos.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f":warning: Totais diferentes do site: {aviso}. Vale rodar uma carga completa."}})
     blocos += [
         {"type": "section", "text": {"type": "mrkdwn", "text": "```" + "\n".join(linhas) + "```"}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": rodape}]},
