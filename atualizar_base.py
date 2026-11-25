@@ -15,7 +15,8 @@ Modo incremental (padrão, o que o Railway roda):
 Modo completo (--completo): baixa cidade por cidade, todo o histórico, e substitui a
 tabela inteira. Útil para realinhar a base de tempos em tempos.
 
-Variável obrigatória: DATABASE_URL (string de conexão do Postgres).
+Variáveis: DATABASE_URL (obrigatória, conexão do Postgres) e SLACK_WEBHOOK_URL
+(opcional: webhook de entrada do Slack que recebe o resumo de cada execução).
 """
 
 import argparse
@@ -26,8 +27,10 @@ import os
 import sys
 import tempfile
 import traceback
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psycopg
 
@@ -237,6 +240,57 @@ def atualizar_completo(conn, pasta: Path, agora: datetime) -> list[dict]:
     return relatorio
 
 
+def notificar_slack(conn, inicio: datetime, relatorio=None, erro: str | None = None):
+    """Resumo no Slack: título, tabela por estado (última data na base e novos
+    eventos) e data/hora da atualização. Falha no envio não derruba o job."""
+    webhook = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook:
+        return
+    try:
+        ultimas = dict(conn.execute(
+            "SELECT state, max(data) FROM ocorrencias GROUP BY state ORDER BY state").fetchall())
+        total, _ = total_base(conn)
+    except Exception:  # noqa: BLE001
+        ultimas, total = {}, None
+    por_estado = {item["estado"]: item for item in (relatorio or []) if "estado" in item and "novas" in item}
+
+    linhas = [f"{'Estado':<16}{'Última data':>13}{'Novos eventos':>16}"]
+    for estado in sorted(set(ultimas) | set(por_estado)):
+        data = ultimas.get(estado)
+        novos = por_estado.get(estado, {}).get("novas")
+        data_txt = f"{data:%d/%m/%Y}" if data else "—"
+        novos_txt = str(novos) if novos is not None else "—"
+        linhas.append(f"{estado:<16}{data_txt:>13}{novos_txt:>16}")
+    if por_estado:
+        linhas.append(f"{'Total':<16}{'':>13}{sum(i['novas'] for i in por_estado.values()):>16}")
+
+    quando = inicio.astimezone(ZoneInfo("America/Sao_Paulo"))
+    rodape = f"Atualização: {quando:%d/%m/%Y às %H:%M} (Brasília)"
+    if total is not None:
+        rodape += f" · base com {total:,} ocorrências".replace(",", ".")
+    blocos = [{"type": "header", "text": {"type": "plain_text", "text": "Fogo Cruzado"}}]
+    if erro:
+        blocos.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f":x: *A atualização falhou* — a base anterior foi mantida.\n`{erro[:500]}`"}})
+    divergentes = [i for i in (relatorio or []) if i.get("total_site") not in (None, i.get("total_base"))]
+    if divergentes:
+        aviso = ", ".join(f"{i['estado']} (site {i['total_site']}, base {i['total_base']})" for i in divergentes)
+        blocos.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f":warning: Totais diferentes do site: {aviso}. Vale rodar uma carga completa."}})
+    blocos += [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "```" + "\n".join(linhas) + "```"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": rodape}]},
+    ]
+    corpo = json.dumps({"text": "Fogo Cruzado — " + ("falha na atualização" if erro else "base atualizada"),
+                        "blocks": blocos}).encode()
+    try:
+        requisicao = urllib.request.Request(webhook, data=corpo, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(requisicao, timeout=20).read()
+        print("Resumo enviado ao Slack.", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"Não foi possível enviar ao Slack: {type(e).__name__}: {e}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--completo", action="store_true",
@@ -255,15 +309,17 @@ def main():
         pasta = Path(tempfile.mkdtemp(prefix="fogo_cruzado_"))
         try:
             if args.completo:
-                atualizar_completo(conn, pasta, inicio)
+                relatorio = atualizar_completo(conn, pasta, inicio)
             else:
-                atualizar_incremental(conn, pasta, inicio)
+                relatorio = atualizar_incremental(conn, pasta, inicio)
             total, cidades = total_base(conn)
             print(f"\nBase atualizada: {total} ocorrências de {cidades} cidades.", flush=True)
+            notificar_slack(conn, inicio, relatorio)
         except Exception as e:
             detalhe = f"{type(e).__name__}: {e}"
             registrar(conn, inicio, "falha", detalhe=f"{modo}: {detalhe}\n{traceback.format_exc()}")
             print(f"\nFALHA — base anterior mantida. {detalhe}", flush=True)
+            notificar_slack(conn, inicio, erro=detalhe)
             sys.exit(1)
 
 

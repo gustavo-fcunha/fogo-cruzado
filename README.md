@@ -41,7 +41,9 @@ cidade (~40 min) e substitui a tabela inteira.
 ## Railway (projeto `fogo-cruzado`, workspace Enter Apps)
 
 - Serviço `atualizador-semanal`, deploy a partir deste repositório (branch `main`).
-- Variável: `DATABASE_URL = ${{Postgres.DATABASE_URL}}`
+- Variáveis: `DATABASE_URL = ${{Postgres.DATABASE_URL}}` e `SLACK_WEBHOOK_URL` (webhook de entrada
+  do Slack; cada execução posta o título "Fogo Cruzado", a tabela Estado | Última data | Novos
+  eventos e a data/hora da atualização — ou o motivo, se falhar)
 - Cron: `0 9 * * 1` (UTC) = toda segunda às 06:00 em Brasília. Restart policy: `NEVER`.
 
 ## Rodar localmente
