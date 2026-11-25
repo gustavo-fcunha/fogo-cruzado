@@ -96,6 +96,9 @@ def nova_pagina(browser):
     page = context.new_page()
     page.set_default_timeout(60_000)
     page.on("response", _registrar_erro_api)
+    page.on("requestfinished", _registrar_lentidao)
+    page.on("requestfailed", lambda req: "api-service" in req.url and print(
+        f"    API sem resposta: {req.url.split('?')[0]} — {req.failure}", flush=True))
     return context, page
 
 
@@ -109,6 +112,14 @@ def _registrar_erro_api(resposta):
         if resposta.status == 429:
             _ultimo_429 = time.time()
         print(f"    API {resposta.status}: {resposta.url.split('?')[0]}", flush=True)
+
+
+def _registrar_lentidao(requisicao):
+    """Lentidão da API também deixa os campos do site vazios: registra no log."""
+    if "api-service" in requisicao.url:
+        duracao_ms = requisicao.timing.get("responseEnd", -1)
+        if duracao_ms > 10_000:
+            print(f"    API lenta ({duracao_ms / 1000:.0f}s): {requisicao.url.split('?')[0]}", flush=True)
 
 
 def pausa_apos_falha(erro: str, tentativa: int, base_s: int):
