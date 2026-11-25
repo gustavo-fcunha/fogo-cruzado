@@ -54,7 +54,23 @@ def abrir_combo(page, data_cy: str):
             return campo
         except PWTimeout:
             page.keyboard.press("Escape")
+    diagnosticar(page, data_cy)
     raise PWTimeout(f"lista do campo {data_cy} não abriu")
+
+
+def diagnosticar(page, data_cy: str):
+    """Registra o que a página mostra quando um campo não abre a lista."""
+    try:
+        campo = page.locator(f'input[data-cy="{data_cy}"]')
+        print(f"    DIAGNÓSTICO {data_cy}: desabilitado={campo.is_disabled()} "
+              f"opções={page.locator('[role=option]').count()} "
+              f"listbox={page.locator('[role=listbox]').count()} url={page.url}", flush=True)
+        for chamada in getattr(page, "_chamadas_api", [])[-8:]:
+            print(f"    DIAGNÓSTICO API: {chamada}", flush=True)
+        texto = " ".join(page.inner_text("body").split())[:400]
+        print(f"    DIAGNÓSTICO tela: {texto}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"    DIAGNÓSTICO indisponível: {e}", flush=True)
 
 
 def opcoes_visiveis(page) -> list[str]:
@@ -96,6 +112,9 @@ def nova_pagina(browser):
     page = context.new_page()
     page.set_default_timeout(60_000)
     page.on("response", _registrar_erro_api)
+    page._chamadas_api = []
+    page.on("response", lambda r: "api-service" in r.url and page._chamadas_api.append(
+        f"{r.status} {r.request.method} {r.url.split('?')[0].split('/api/v2')[-1]}"))
     page.on("requestfinished", _registrar_lentidao)
     page.on("requestfailed", lambda req: "api-service" in req.url and print(
         f"    API sem resposta: {req.url.split('?')[0]} — {req.failure}", flush=True))
